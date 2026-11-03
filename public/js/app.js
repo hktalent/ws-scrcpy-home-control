@@ -309,35 +309,85 @@
     return { x: Math.round(imgX), y: Math.round(imgY) };
   }
 
+  // Track active pointers
+  let activePointers = 0;          // # of fingers currently on screen
+  let lastMoveX = 0, lastMoveY = 0;
+  let lastMoveTime = 0;
+  let isPanScrolling = false;      // true = we're in an ongoing scroll gesture
+
   videoArea.addEventListener('touchstart', (e) => {
     e.preventDefault();
     if (!currentSerial) return;
+    activePointers = e.touches.length;
     const t = e.touches[0];
     touchStartTime = Date.now();
     touchStartX = t.clientX;
     touchStartY = t.clientY;
+    lastMoveX = t.clientX;
+    lastMoveY = t.clientY;
+    lastMoveTime = Date.now();
+    isPanScrolling = false;
   }, { passive: false });
 
   videoArea.addEventListener('touchmove', (e) => {
     e.preventDefault();
+    if (!currentSerial) return;
+    if (!e.touches.length) return;
+
+    const now = Date.now();
+    const t = e.touches[0];
+    const dx = t.clientX - lastMoveX;
+    const dy = t.clientY - lastMoveY;
+    const dt = now - lastMoveTime;
+
+    // Only send if there's meaningful movement
+    if (Math.abs(dx) >= 4 || Math.abs(dy) >= 4) {
+      const moved = Math.sqrt(dx*dx + dy*dy);
+      activePointers = e.touches.length;
+      const coordsFrom = getImageCoords(lastMoveX, lastMoveY);
+      const coordsTo = getImageCoords(t.clientX, t.clientY);
+      if (coordsFrom && coordsTo) {
+        isPanScrolling = true;
+        sendMsg('control', {
+          control: {
+            action: 'swipe',
+            x1: coordsFrom.x, y1: coordsFrom.y,
+            x2: coordsTo.x,   y2: coordsTo.y,
+            duration: Math.max(30, dt)
+          }
+        });
+      }
+    }
+    lastMoveX = t.clientX;
+    lastMoveY = t.clientY;
+    lastMoveTime = now;
   }, { passive: false });
 
   videoArea.addEventListener('touchend', (e) => {
     e.preventDefault();
     if (!currentSerial) return;
+
+    // If we were in a continuous scroll gesture, don't send tap at the end
+    if (isPanScrolling) {
+      activePointers = 0;
+      isPanScrolling = false;
+      return;
+    }
+
     const t = e.changedTouches[0];
     const duration = Date.now() - touchStartTime;
     const dx = t.clientX - touchStartX;
     const dy = t.clientY - touchStartY;
     const distance = Math.sqrt(dx*dx + dy*dy);
-    
+
     const coordsStart = getImageCoords(touchStartX, touchStartY);
     const coordsEnd = getImageCoords(t.clientX, t.clientY);
-    
+
     if (!coordsStart) return;
-    
+
+    activePointers = 0;
+
     if (distance > 30 && duration < 1000) {
-      // Swipe
       sendMsg('control', {
         control: {
           action: 'swipe',
@@ -348,7 +398,6 @@
         }
       });
     } else {
-      // Tap
       sendMsg('control', {
         control: { action: 'tap', x: coordsStart.x, y: coordsStart.y }
       });
@@ -395,6 +444,69 @@
       sendMsg('control', {
         control: { action: 'tap', x: coordsStart.x, y: coordsStart.y }
       });
+    }
+  });
+
+  // ===== Mouse wheel → swipe up/down =====
+  let wheelCooldown = 0;
+  videoArea.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (!currentSerial) return;
+    const now = Date.now();
+    if (now - wheelCooldown < 120) return; // debounce 120ms
+    wheelCooldown = now;
+
+    // swipe distance proportional to deltaY, clamp
+    const dy = Math.max(100, Math.min(800, Math.abs(e.deltaY) * 4));
+    const up = e.deltaY < 0;
+    const coords = getImageCoords(e.clientX, e.clientY) || { x: 540, y: 900 };
+    const y1 = coords.y;
+    const y2 = up ? y1 + dy : Math.max(0, y1 - dy); // scroll up = content goes down = swipe up
+    sendMsg('control', {
+      control: {
+        action: 'swipe',
+        x1: coords.x, y1,
+        x2: coords.x, y2,
+        duration: 150
+      }
+    });
+  }, { passive: false });
+
+  // ===== Global keyboard → send Android keyevents =====
+  document.addEventListener('keydown', (e) => {
+    // Ignore if typing in input fields
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (!currentSerial) return;
+
+    const keyMap = {
+      'ArrowUp': 19,
+      'ArrowDown': 20,
+      'ArrowLeft': 21,
+      'ArrowRight': 22,
+      'Enter': 66,
+      'Escape': 4,
+      'Backspace': 67,
+      ' ': 62,        // space → play/pause
+      'MediaPlay': 126,
+      'MediaPause': 127,
+      'MediaPlayPause': 85,
+      'Home': 3,
+      'BrowserBack': 4,
+    };
+
+    // Single-character keys → send as text input (useful for Android TV search)
+    // But only when a modifier is NOT held, to avoid hijacking Ctrl+R etc.
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // We support sending printable chars via adb shell input text
+      sendMsg('control', { control: { action: 'text', text: e.key } });
+      e.preventDefault();
+      return;
+    }
+
+    const keycode = keyMap[e.key];
+    if (keycode !== undefined) {
+      sendMsg('control', { control: { action: 'key', keycode } });
+      e.preventDefault();
     }
   });
 

@@ -369,6 +369,13 @@ function sendAdbKey(serial, keycode) {
   adbClient.shell(serial, `input keyevent ${keycode}`);
 }
 
+function sendAdbText(serial, text) {
+  if (!adbClient || !text) return;
+  // Escape special chars for adb shell
+  const escaped = text.replace(/'/g, `'"'"'`).replace(/"/g, '\\"');
+  adbClient.shell(serial, `input text "${escaped}"`);
+}
+
 // ====== HTTP Server ======
 const app = express();
 const publicDir = path.join(__dirname, '..', 'public');
@@ -401,7 +408,7 @@ app.get('/video/mjpeg', async (req, res) => {
   const serial = req.query.serial;
   if (!serial) { res.status(400).send('serial required'); return; }
   
-  const fps = Math.min(parseInt(req.query.fps) || 2, 5); // max 5 fps
+  const fps = Math.min(parseInt(req.query.fps) || 10, 15); // default 10, max 15 fps
   const interval = 1000 / fps;
   
   res.writeHead(200, {
@@ -571,6 +578,9 @@ wss.on('connection', (ws, req) => {
       } else if (ctrl.action === 'key') {
         log('[CONTROL] KEY', ctrl.keycode);
         sendAdbKey(currentSerial, ctrl.keycode);
+      } else if (ctrl.action === 'text') {
+        log('[CONTROL] TEXT', JSON.stringify(ctrl.text));
+        sendAdbText(currentSerial, ctrl.text);
       } else if (ctrl.action === 'touch') {
         const act = ctrl.touch_action;
         if (act === 0) {

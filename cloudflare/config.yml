@@ -1,0 +1,40 @@
+# Cloudflare Tunnel config for ws-scrcpy-home-control
+# Replace TUNNEL_NAME with your actual tunnel name and make sure credentials.json is in this folder
+#
+# Prerequisites:
+# 1. Install cloudflared: https://github.com/cloudflare/cloudflared/releases
+# 2. Login: cloudflared tunnel login tv.51pwn.com
+# 3. Create tunnel: cloudflared tunnel create scrcpy-home
+# 4. Copy credentials: cp ~/.cloudflared/<TUNNEL-UUID>.json ./cloudflare/credentials.json
+# 5. Configure DNS: cloudflared tunnel route dns scrcpy-home tv.51pwn.com
+
+tunnel: scrcpy-home
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  # WebSocket endpoint (critical!)
+  - hostname: tv.51pwn.com
+    service: http://host.docker.internal:8080
+    path: /ws
+
+  # MJPEG video stream
+  - hostname: tv.51pwn.com
+    service: http://host.docker.internal:8080
+    path: /video
+
+  # Screenshot endpoint
+  - hostname: tv.51pwn.com
+    service: http://host.docker.internal:8080
+    path: /video/screenshot
+
+  # API endpoints
+  - hostname: tv.51pwn.com
+    service: http://host.docker.internal:8080
+    path: /api
+
+  # Everything else (static frontend)
+  - hostname: tv.51pwn.com
+    service: http://host.docker.internal:8080
+
+  # Catch-all
+  - service: http_status:404
