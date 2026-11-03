@@ -1,0 +1,73 @@
+# ws-scrcpy-home-control docker-compose
+# Cloudflare Tunnel 已复用 51pwn-docker 里的 51pwn-cloudflared 容器 (tunnel 416d8666-...)
+# ingress: tv.51pwn.com → http://host.docker.internal:8080 (配置见 51pwn-docker/cloudflared/config.yml)
+services:
+  ws-scrcpy-home:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ws-scrcpy-home:latest
+    container_name: ws-scrcpy-home
+    restart: unless-stopped
+    # macOS Docker Desktop: bridge + port（host.docker.internal 自动可用）
+    # Linux host 上如需扫 LAN: network_mode: host 或 host-gateway 配好
+    ports:
+      # macOS Docker Desktop: host.docker.internal 指向宿主真实 IP（不是 127.0.0.1）
+      # cloudflared 容器通过它访问，所以必须监听 0.0.0.0:8080
+      - "8080:8080"
+      # ADB 5037 不在宿主暴露，容器内自带 ADB server 自行监听
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - HOST=0.0.0.0
+      - CONFIG_PATH=/app/config/default.json
+      # 关键：容器 ADB daemon 扫不到 LAN 192.168.0.0/24 网段的设备
+      # 让 Node.js server 复用宿主 ADB daemon（宿主已 adb -a start-server）
+      - ADB_HOST=host.docker.internal
+      - ADB_PORT=5037
+    volumes:
+      - ./config/default.json:/app/config/default.json:ro
+      - adb_data:/root/.android
+    cap_add:
+      - NET_RAW
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default                   # scrcpy 自己的 compose 网络
+      - platform-shared           # ← 共享 51pwn-docker_default，cloudflared 容器可通过容器名 reach
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--max-redirect=0", "http://127.0.0.1:8080/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Cloudflare Tunnel —— 可选：独立跑一个 tunnel connector
+  # 默认不启用（共用 51pwn-cloudflared 容器，省资源）
+  # 需要独立时：去掉下面的注释，并在 cloudflare/ 放 credentials.json
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: cloudflared-scrcpy
+  #   restart: unless-stopped
+  #   depends_on:
+  #     ws-scrcpy-home:
+  #       condition: service_healthy
+  #   command: tunnel --config /etc/cloudflared/config.yml run
+  #   volumes:
+  #     - ./cloudflare/config.yml:/etc/cloudflared/config.yml:ro
+  #     - ./cloudflare/credentials.json:/etc/cloudflared/credentials.json:ro
+
+volumes:
+  adb_data:
+
+networks:
+  # 跟 51pwn-docker 共享同一个 bridge 网络
+  # 让 ws-scrcpy-home 容器名可被 cloudflared/nginx 等容器 DNS 解析
+  platform-shared:
+    external: true
+    name: 51pwn-docker_default

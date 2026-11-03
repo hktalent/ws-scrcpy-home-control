@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+.DS_Store
+*.log
+.env
+.env.local
+cloudflare/credentials.json
+*.pid
+coverage
+.tmp
+dist

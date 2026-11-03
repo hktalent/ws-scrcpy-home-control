@@ -1,0 +1,34 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "auth": {
+    "password": "xxyxx"
+  },
+  "scrcpy": {
+    "maxSize": 1024,
+    "bitrate": 8000000,
+    "maxFps": 30
+  },
+  "devices": [
+    {
+      "name": "TCL电视",
+      "ip": "192.168.0.131",
+      "port": 5555,
+      "type": "tv"
+    },
+    {
+      "name": "投影仪",
+      "ip": "192.168.0.120",
+      "port": 5555,
+      "type": "projector"
+    }
+  ],
+  "scan": {
+    "enabled": false,
+    "subnet": "192.168.0.0/24",
+    "ports": [5555],
+    "timeout": 300
+  }
+}

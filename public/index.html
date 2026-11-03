@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>家庭设备远程控制</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- Auth Screen -->
+<div id="auth-screen" class="screen active">
+  <div class="auth-container">
+    <h1>🔐 设备控制</h1>
+    <p class="subtitle">请输入密码以连接设备</p>
+    <form id="auth-form" class="auth-form">
+      <input type="password" id="password-input" placeholder="输入密码" autocomplete="current-password">
+      <button type="submit" class="btn-primary">连接</button>
+    </form>
+    <div id="auth-message" class="message hidden"></div>
+  </div>
+</div>
+
+<!-- Device Select Screen -->
+<div id="device-screen" class="screen">
+  <div class="device-container">
+    <div class="header">
+      <h1>📺 选择设备</h1>
+      <button id="refresh-btn" class="btn-icon" title="刷新">🔄</button>
+    </div>
+    <div id="device-list" class="device-list">
+      <p class="loading">正在扫描设备...</p>
+    </div>
+  </div>
+</div>
+
+<!-- Control Screen -->
+<div id="control-screen" class="screen">
+  <div class="control-container">
+    <div class="top-bar">
+      <button id="back-btn" class="btn-icon" title="返回">←</button>
+      <span id="current-device-name" class="device-name">---</span>
+      <span class="status-dot online" id="status-dot">●</span>
+    </div>
+    
+    <div class="video-area">
+      <canvas id="video-canvas"></canvas>
+      <div id="loading-overlay" class="overlay">
+        <div class="spinner"></div>
+        <p>连接中...</p>
+      </div>
+      <div id="error-overlay" class="overlay hidden">
+        <p id="error-message">连接失败</p>
+        <button id="retry-btn" class="btn-primary">重试</button>
+      </div>
+    </div>
+    
+    <div class="control-buttons">
+      <button class="ctrl-btn" data-keycode="3" title="Home">🏠</button>
+      <button class="ctrl-btn" data-keycode="4" title="Back">⬅️</button>
+      <button class="ctrl-btn" data-keycode="82" title="Menu">📋</button>
+      <button class="ctrl-btn" data-keycode="26" title="Power">⚡</button>
+      <button class="ctrl-btn" data-keycode="24" title="Volume Up">🔊</button>
+      <button class="ctrl-btn" data-keycode="25" title="Volume Down">🔉</button>
+      <button class="ctrl-btn" data-keycode="187" title="Recent Apps">🪟</button>
+      <button class="ctrl-btn" id="screenshot-btn" title="Screenshot">📸</button>
+    </div>
+  </div>
+</div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
