@@ -303,6 +303,45 @@ html, body {
   to { transform: rotate(360deg); }
 }
 
+/* 十字方向键 (DPAD) — 手机上文字太难点，用方向键移动焦点 */
+.dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 8px;
+  width: 200px;
+  max-width: 60vw;
+  margin: 12px auto 4px;
+}
+.dpad-btn {
+  aspect-ratio: 1 / 1;
+  border: none;
+  border-radius: 14px;
+  background: #16213e;
+  color: #eee;
+  font-size: 1.4rem;
+  font-weight: bold;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.08s, background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.dpad-btn:active {
+  transform: scale(0.9);
+  background: #e94560;
+}
+.dpad-btn.dpad-ok {
+  background: #e94560;
+  font-size: 1rem;
+  letter-spacing: 1px;
+}
+.dpad-btn.dpad-ok:active {
+  background: #ff6b81;
+}
+
 .control-buttons {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -329,6 +368,18 @@ html, body {
 
 /* Landscape optimization */
 @media (orientation: landscape) and (max-height: 500px) {
+  .dpad {
+    width: 110px;
+    gap: 5px;
+    margin: 6px auto;
+  }
+  .dpad-btn {
+    font-size: 1rem;
+    border-radius: 10px;
+  }
+  .dpad-btn.dpad-ok {
+    font-size: 0.7rem;
+  }
   .control-buttons {
     grid-template-columns: repeat(8, 1fr);
     padding: 8px;

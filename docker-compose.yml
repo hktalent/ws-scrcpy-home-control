@@ -25,6 +25,9 @@ services:
       # 让 Node.js server 复用宿主 ADB daemon（宿主已 adb -a start-server）
       - ADB_HOST=host.docker.internal
       - ADB_PORT=5037
+      # H264 采集参数（screenrecord 硬件编码，浏览器 WebCodecs 解码）
+      - H264_SIZE=1280x720
+      - H264_BITRATE=1000000
     volumes:
       - ./config/default.json:/app/config/default.json:ro
       - adb_data:/root/.android

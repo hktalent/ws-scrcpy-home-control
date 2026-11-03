@@ -17,7 +17,7 @@ const express = require('express');
 const { WebSocketServer } = require('ws');
 const adb = require('adbkit');
 const net = require('net');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 
 // ====== Config ======
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, '..', 'config', 'default.json');
@@ -58,6 +58,250 @@ let backgroundRefreshPromise = null;
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
+}
+
+// ====== H264 采集（screenrecord 流式）======
+// 为什么不用 screencap：本机实测 1080p PNG 截图在电视上要 ~1s/帧（设备端 PNG 编码是瓶颈）。
+// screenrecord 走硬件编码器，输出 Annex-B H264，只传帧间差异（天然"增量"），浏览器 WebCodecs 解码。
+const ADB_BIN = process.env.ADB_BIN || 'adb';
+const H264_SIZE = process.env.H264_SIZE || '1280x720';
+const H264_BITRATE = parseInt(process.env.H264_BITRATE || '2000000', 10);
+const H264_TIME_LIMIT = 170; // screenrecord 单次上限（秒），到期自动重启
+const _parsedSize = (H264_SIZE || '1280x720').split('x').map(Number);
+const ENC_W = _parsedSize[0] || 1280; // 编码宽度（点击坐标的源空间）
+const ENC_H = _parsedSize[1] || 720;  // 编码高度
+
+// 设备原生分辨率缓存（点击坐标需从编码空间缩放到设备原生空间）
+// 例如：流 1280x720，设备 1920x1080 → 坐标需 ×1.5
+const deviceResCache = new Map(); // serial -> {w, h, t}
+async function getDeviceResolution(serial) {
+  const cached = deviceResCache.get(serial);
+  const now = Date.now();
+  if (cached && now - cached.t < 60000) return { w: cached.w, h: cached.h };
+  let w = 0, h = 0;
+  try {
+    if (adbClient) {
+      const s = await adbClient.shell(serial, 'wm size');
+      const out = await streamToString(s);
+      // input tap/swipe 的坐标基于「当前显示尺寸」：优先 Override size，其次 Physical size
+      let m = /Override size:\s*(\d+)x(\d+)/.exec(out);
+      if (!m) m = /Physical size:\s*(\d+)x(\d+)/.exec(out);
+      if (m) { w = parseInt(m[1], 10); h = parseInt(m[2], 10); }
+    }
+  } catch (e) { /* ignore, use fallback */ }
+  if (!w || !h) { w = ENC_W; h = ENC_H; } // 查不到就不缩放
+  deviceResCache.set(serial, { w, h, t: now });
+  return { w, h };
+}
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    let s = '';
+    stream.on('data', (c) => { s += c.toString(); });
+    stream.on('end', () => resolve(s));
+    stream.on('error', reject);
+  });
+}
+
+class H264Capture {
+  constructor(serial) {
+    this.serial = serial;
+    this.clients = new Set();
+    this.proc = null;
+    this.stopping = true;
+    this.starting = false;
+    this.restartTimer = null;
+    this.lastFrameAt = 0;
+    this.bytes = 0;
+    // 缓存最新的 SPS/PPS，新客户端加入时先补发，让解码器立即 configure
+    this.sps = null;
+    this.pps = null;
+    this.lastKeyframeAt = 0;
+    this._parseTail = null;   // 跨 chunk 拼接用（解析起始码）
+    this._restartPending = false;
+    this._lastRestartAt = 0;
+  }
+
+  _adbArgs() {
+    const args = ['-H', ADB_HOST, '-P', String(ADB_PORT), '-s', this.serial, 'exec-out', 'screenrecord',
+      '--output-format=h264', '--bit-rate', String(H264_BITRATE), '--time-limit', String(H264_TIME_LIMIT)];
+    if (H264_SIZE) args.push('--size', H264_SIZE);
+    args.push('-');
+    return args;
+  }
+
+  start() {
+    if (this.proc || this.clients.size === 0 || this.starting) return;
+    this.starting = true;
+    this.stopping = false;
+    this._lastRestartAt = Date.now();
+    // 先清掉设备上可能残留的 screenrecord（否则并发会静默失败）
+    const base = ['-H', ADB_HOST, '-P', String(ADB_PORT), '-s', this.serial];
+    let preCleaned = false;
+    const preClean = () => {
+      if (preCleaned) return;
+      preCleaned = true;
+      this.starting = false;
+      this._spawnCapture();
+    };
+    try {
+      const killer = spawn(ADB_BIN, [...base, 'shell', 'pkill -f screenrecord'], { stdio: 'ignore' });
+      killer.on('exit', preClean);
+      killer.on('error', preClean);
+      setTimeout(preClean, 1000);
+    } catch (e) {
+      preClean();
+    }
+  }
+
+  _spawnCapture() {
+    if (this.proc || this.clients.size === 0 || this.stopping) return;
+    const args = this._adbArgs();
+    let p;
+    try {
+      p = spawn(ADB_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      log('[H264] spawn failed:', e.message);
+      return;
+    }
+    this.proc = p;
+    this.bytes = 0;
+    log('[H264] capture start', this.serial, H264_SIZE, `${H264_BITRATE}bps`);
+
+    p.stdout.on('data', (chunk) => {
+      this.bytes += chunk.length;
+      this.lastFrameAt = Date.now();
+      this._feedParse(chunk); // 缓存 SPS/PPS、记录关键帧时间
+      // Buffer 直接以二进制下发（前端按 Annex-B 起始码自行拼帧）
+      for (const ws of this.clients) {
+        if (ws.readyState === 1) {
+          try { ws.send(chunk); } catch (e) {}
+        } else {
+          this.clients.delete(ws); // 顺便清理死掉的客户端
+        }
+      }
+    });
+
+    p.stderr.on('data', (d) => {
+      const s = d.toString().trim();
+      if (s) log('[H264][stderr]', this.serial, s.slice(0, 300));
+    });
+
+    p.on('error', (e) => log('[H264] proc error:', e.message));
+
+    p.on('exit', (code, sig) => {
+      this.proc = null;
+      this._restartPending = false;
+      log('[H264] capture exit', this.serial, 'code=', code, 'sig=', sig, 'bytes=', this.bytes);
+      if (!this.stopping && this.clients.size > 0) {
+        clearTimeout(this.restartTimer);
+        this.restartTimer = setTimeout(() => this.start(), 400);
+      }
+    });
+  }
+
+  // 解析 chunk 中的 NAL：缓存最新 SPS(type7)/PPS(type8)，遇到 IDR(type5) 记录时间
+  _feedParse(chunk) {
+    const data = this._parseTail ? Buffer.concat([this._parseTail, chunk]) : chunk;
+    this._parseTail = null;
+    const starts = [];
+    for (let i = 0; i + 2 < data.length; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+        starts.push(i);
+        i += 2;
+      }
+    }
+    // 末尾不足一个起始码的部分留到下个 chunk（防止起始码被截断）
+    const lastStart = starts.length ? starts[starts.length - 1] : -1;
+    const tailLen = data.length - lastStart;
+    if (lastStart >= 0 && tailLen < 5) {
+      this._parseTail = data.slice(lastStart);
+    }
+    for (let k = 0; k < starts.length; k++) {
+      const p = starts[k];
+      const hdr = p + 3;
+      if (hdr >= data.length) break;
+      const t = data[hdr] & 0x1f;
+      const end = (k + 1 < starts.length) ? starts[k + 1] : data.length;
+      if (end - hdr <= 0) continue;
+      if (t === 7) this.sps = data.slice(hdr, end);
+      else if (t === 8) this.pps = data.slice(hdr, end);
+      else if (t === 5) this.lastKeyframeAt = Date.now();
+    }
+  }
+
+  // 清理 readyState 不是 OPEN 的死客户端（WS 已断但没触发 remove 的情况）
+  _prune() {
+    for (const ws of [...this.clients]) {
+      if (ws.readyState !== 1) this.clients.delete(ws);
+    }
+  }
+
+  // 新客户端加入：补发缓存的 SPS/PPS 让解码器立即 configure；
+  // 若采集已在运行，强制重启一次以发出新的 IDR 关键帧（否则客户端只有 P 帧解不出画面）。
+  add(ws) {
+    this._prune();
+    this.clients.add(ws);
+    this.stopping = false;
+
+    // 1) 先补发 SPS/PPS（Annex-B），让浏览器 VideoDecoder 立即完成 configure
+    if (this.sps && this.pps) {
+      const pre = Buffer.concat([
+        Buffer.from([0, 0, 0, 1]), this.sps,
+        Buffer.from([0, 0, 0, 1]), this.pps
+      ]);
+      try { ws.send(pre); } catch (e) {}
+    }
+
+    if (!this.proc) {
+      // 没有运行中的采集 → 全新启动，首帧自带 SPS/PPS/IDR
+      this.start();
+    } else {
+      log('[H264] client joined', this.serial, 'liveClients=', this.clients.size);
+      // 2) 已有采集在跑 → 客户端拿到的都是 P 帧，无法解码。重启采集发一个新 IDR。
+      //    节流：距上次重启不足 1.5s 就不重启（此时新 IDR 应该刚发过）。
+      if (Date.now() - this._lastRestartAt > 1500) {
+        this._scheduleRestart();
+      }
+    }
+  }
+
+  _scheduleRestart() {
+    if (this._restartPending || this.stopping || !this.proc) return;
+    this._restartPending = true;
+    setTimeout(() => {
+      this._restartPending = false;
+      if (!this.proc || this.clients.size === 0 || this.stopping) return;
+      log('[H264] force keyframe: restarting capture for new client', this.serial);
+      try { this.proc.kill('SIGKILL'); } catch (e) {}
+      // 不手动 start：exit handler 会在 400ms 后重启，避免双重 spawn
+    }, 60);
+  }
+
+  remove(ws) {
+    this.clients.delete(ws);
+    this._prune();
+    if (this.clients.size === 0) {
+      this.stopping = true;
+      clearTimeout(this.restartTimer);
+      this._restartPending = false;
+      if (this.proc) {
+        log('[H264] no clients, stopping capture', this.serial);
+        try { this.proc.kill('SIGKILL'); } catch (e) {}
+        this.proc = null;
+      }
+    }
+  }
+}
+
+const h264Captures = new Map();
+function getH264Capture(serial) {
+  if (!h264Captures.has(serial)) {
+    h264Captures.set(serial, new H264Capture(serial));
+  }
+  return h264Captures.get(serial);
+}
+function detachAllCaptures(ws) {
+  for (const cap of h264Captures.values()) cap.remove(ws);
 }
 
 function ipToInt(ip) {
@@ -176,7 +420,7 @@ async function getAllDevices(forceRefresh = false) {
       ip: d.ip,
       port: d.port || 5555,
       type: d.type || 'generic',
-      online: false
+      online: true // 乐观默认：真正连接失败时前端会收到错误
     })) : [];
     devicesCache = fastDevices;
     devicesCacheTime = Date.now();
@@ -200,29 +444,35 @@ async function getAllDevices(forceRefresh = false) {
     }
   }
   
+  // 缓存配置设备（首次响应要快）
+  const prevOnline = new Map();
+  for (const d of deviceCache.values()) prevOnline.set(d.serial, d.online);
+
   // Cache configured devices immediately so first response is fast
   devicesCache = devices;
   devicesCacheTime = Date.now();
   deviceCache.clear();
   for (const d of devices) deviceCache.set(d.serial, d);
-  
+
   // 2. Then do the slow network operations (scan + adb check)
   const scanPromise = config.scan && config.scan.enabled ? scanNetwork() : Promise.resolve([]);
-  
+
   // Also check ADB devices (may hang if adb server not responsive)
-  const adbPromise = adbClient 
+  const adbPromise = adbClient
     ? Promise.race([
         adbClient.listDevices()
-          .then(list => { log('[DEVICES] ADB listDevices returned', list.length, 'devices:', list.map(d=>d.id)); return list; })
-          .catch(e => { log('[DEVICES] ADB listDevices ERROR:', e.message); return []; }),
-        new Promise(resolve => setTimeout(() => { log('[DEVICES] ADB listDevices TIMEOUT'); resolve([]); }, 3000))
+          .then(list => { log('[DEVICES] ADB listDevices returned', list.length, 'devices:', list.map(d=>d.id)); return { ok: true, list }; })
+          .catch(e => { log('[DEVICES] ADB listDevices ERROR:', e.message); return { ok: false, list: [] }; }),
+        new Promise(resolve => setTimeout(() => { log('[DEVICES] ADB listDevices TIMEOUT'); resolve({ ok: false, list: [] }); }, 8000))
       ])
-    : Promise.resolve([]);
-  
+    : Promise.resolve({ ok: false, list: [] });
+
   try {
-    const [scanned, adbDevices] = await Promise.all([scanPromise, adbPromise]);
-    log('[DEVICES] scanned:', scanned.length, 'adbDevices:', adbDevices.length);
-    
+    const [scanned, adbResult] = await Promise.all([scanPromise, adbPromise]);
+    const adbDevices = adbResult.list || [];
+    const adbOk = adbResult.ok;
+    log('[DEVICES] scanned:', scanned.length, 'adbDevices:', adbDevices.length, 'adbOk:', adbOk);
+
     // Merge scanned devices
     for (const s of scanned) {
       const serial = `${s.ip}:${s.port}`;
@@ -233,13 +483,19 @@ async function getAllDevices(forceRefresh = false) {
         });
       }
     }
-    
-    // Mark online via ADB
+
+    // Mark online via ADB：ADB 查询失败时保持上次状态，不要误判为离线（否则前端会禁用点击）
     for (const dev of devices) {
-      const match = adbDevices.find(a => 
+      const match = adbDevices.find(a =>
         a.id === dev.serial || (a.id.startsWith(`${dev.ip}:`) && a.type === 'device')
       );
-      dev.online = !!match;
+      if (match) {
+        dev.online = true;
+      } else if (adbOk) {
+        dev.online = false;
+      } else {
+        dev.online = prevOnline.has(dev.serial) ? prevOnline.get(dev.serial) : true;
+      }
     }
     
     // Add extra ADB devices
@@ -287,30 +543,21 @@ async function startScrcpySession(serial, wsClient) {
 
   log('[SESSION] Starting session for', serial);
 
-  // 1. Make sure ADB is connected to the device
-  try {
-    const [ip, port] = serial.split(':');
-    await adbClient.connect(ip, parseInt(port) || 5555);
-    log('[SESSION] ADB connected to', serial);
-  } catch (e) {
-    // May already be connected — adbClient.listDevices() would fail otherwise
-    log('[SESSION] adb connect (may already exist):', e.message);
-  }
+  // 1. 确保 ADB 已连接设备（最多等 2s，避免阻塞前端进入控制界面）
+  const [ip, port] = serial.split(':');
+  const connectPromise = adbClient.connect(ip, parseInt(port) || 5555)
+    .then(() => log('[SESSION] ADB connected to', serial))
+    .catch((e) => log('[SESSION] adb connect failed (may already exist):', e.message));
+  await Promise.race([
+    connectPromise,
+    new Promise((resolve) => setTimeout(resolve, 2000))
+  ]);
 
-  // 2. Quick health check: try screencap to confirm device is really usable
-  try {
-    const stream = await adbClient.screencap(serial);
-    await streamToBuffer(stream);
-  } catch (e) {
-    log('[SESSION] ADB screencap failed for', serial, '- device may be offline:', e.message);
-    wsClient.send(JSON.stringify({ type: 'error', message: '设备 ADB 不可用: ' + e.message }));
-    return null;
-  }
-
-  // 3. Register session
+  // 2. 直接注册会话（不再做 screencap 健康检查：1080p 截图在设备上要 ~1s）
+  //    可用性由 H264 流是否真的有数据来判定（前端有 8s 看门狗）
   const session = { serial, ws: wsClient };
   scrcpySessions.set(serial, session);
-  log('[SESSION] Session ready for', serial, '— video via MJPEG, control via adb shell');
+  log('[SESSION] Session ready for', serial, '— video via H264/screenrecord, control via adb shell');
 
   return session;
 }
@@ -408,7 +655,7 @@ app.get('/video/mjpeg', async (req, res) => {
   const serial = req.query.serial;
   if (!serial) { res.status(400).send('serial required'); return; }
   
-  const fps = Math.min(parseInt(req.query.fps) || 10, 15); // default 10, max 15 fps
+  const fps = Math.min(parseInt(req.query.fps) || 3, 5); // 兜底流：screencap 设备端很慢，3fps 足够
   const interval = 1000 / fps;
   
   res.writeHead(200, {
@@ -426,6 +673,7 @@ app.get('/video/mjpeg', async (req, res) => {
   req.on('end', () => { cancelled = true; });
   
   log('[MJPEG] Stream started for', serial, '@', fps, 'fps');
+  let lastFrame = null; // 画面没变就不发，省带宽
   
   while (!cancelled) {
     const frameStart = Date.now();
@@ -435,7 +683,8 @@ app.get('/video/mjpeg', async (req, res) => {
       const stream = await adbClient.screencap(serial);
       const pngData = await streamToBuffer(stream);
       
-      if (Buffer.isBuffer(pngData) && pngData.length > 100) {
+      if (Buffer.isBuffer(pngData) && pngData.length > 100 && (!lastFrame || !pngData.equals(lastFrame))) {
+        lastFrame = pngData;
         res.write('--frame\r\n');
         res.write('Content-Type: image/png\r\n');
         res.write(`Content-Length: ${pngData.length}\r\n\r\n`);
@@ -558,9 +807,31 @@ wss.on('connection', (ws, req) => {
     if (msg.type === 'disconnect_device') {
       if (currentSerial) {
         stopScrcpySession(currentSerial);
+        detachAllCaptures(ws);
         currentSerial = null;
       }
       ws.send(JSON.stringify({ type: 'disconnected' }));
+      return;
+    }
+
+    // 开始 H264 视频流（浏览器 WebCodecs 解码）
+    if (msg.type === 'video_start') {
+      const serial = msg.serial || currentSerial;
+      if (!serial) {
+        ws.send(JSON.stringify({ type: 'error', message: 'video_start 缺少 serial' }));
+        return;
+      }
+      const cap = getH264Capture(serial);
+      cap.add(ws);
+      const [w, h] = (msg.size || H264_SIZE || '1280x720').split('x').map(Number);
+      ws.send(JSON.stringify({ type: 'video_meta', codec: 'h264', width: w, height: h, bitrate: H264_BITRATE }));
+      log('[VIDEO] video_start', serial, 'clients=', cap.clients.size);
+      return;
+    }
+
+    // 停止视频流
+    if (msg.type === 'video_stop') {
+      detachAllCaptures(ws);
       return;
     }
     
@@ -568,13 +839,23 @@ wss.on('connection', (ws, req) => {
     log('[WS] control event received, currentSerial=', currentSerial, 'msg=', JSON.stringify(msg.control || {}).slice(0,100));
     if (msg.type === 'control' && currentSerial) {
       const ctrl = msg.control || {};
-      
+      // 坐标缩放：前端坐标基于"显示源分辨率"（H264=编码尺寸如1280x720；MJPEG=设备原生截图如1920x1080），
+      // input tap/swipe 需要设备原生像素坐标。前端会上报 srcW/srcH，缺失则按编码尺寸兜底。
+      const res = await getDeviceResolution(currentSerial);
+      const srcW = ctrl.srcW > 0 ? ctrl.srcW : ENC_W;
+      const srcH = ctrl.srcH > 0 ? ctrl.srcH : ENC_H;
+      const sx = res.w / srcW;
+      const sy = res.h / srcH;
+
       if (ctrl.action === 'tap') {
-        log('[CONTROL] TAP', ctrl.x, ctrl.y, '→', currentSerial);
-        sendAdbTap(currentSerial, ctrl.x, ctrl.y);
+        const x = Math.round(ctrl.x * sx), y = Math.round(ctrl.y * sy);
+        log('[CONTROL] TAP', ctrl.x, ctrl.y, '→ scaled', x, y, `(${res.w}x${res.h}) →`, currentSerial);
+        sendAdbTap(currentSerial, x, y);
       } else if (ctrl.action === 'swipe') {
-        log('[CONTROL] SWIPE', ctrl.x1, ctrl.y1, '→', ctrl.x2, ctrl.y2);
-        sendAdbSwipe(currentSerial, ctrl.x1, ctrl.y1, ctrl.x2, ctrl.y2, ctrl.duration || 300);
+        const x1 = Math.round(ctrl.x1 * sx), y1 = Math.round(ctrl.y1 * sy);
+        const x2 = Math.round(ctrl.x2 * sx), y2 = Math.round(ctrl.y2 * sy);
+        log('[CONTROL] SWIPE', ctrl.x1, ctrl.y1, '→', ctrl.x2, ctrl.y2, '→ scaled', x1, y1, '→', x2, y2);
+        sendAdbSwipe(currentSerial, x1, y1, x2, y2, ctrl.duration || 300);
       } else if (ctrl.action === 'key') {
         log('[CONTROL] KEY', ctrl.keycode);
         sendAdbKey(currentSerial, ctrl.keycode);
@@ -595,6 +876,7 @@ wss.on('connection', (ws, req) => {
   
   ws.on('close', () => {
     log('[WS] Connection closed:', clientIp);
+    detachAllCaptures(ws);
     // Cleanup: stop session if it exists
     if (currentSerial) {
       stopScrcpySession(currentSerial);

@@ -6,7 +6,8 @@
 
 ## 功能
 
-- **实时画面**：`adb screencap` → MJPEG 流（10fps）
+- **实时画面**：设备端 `screenrecord` 硬件编码 H264（1280x720 / 2Mbps）→ WebSocket 传 Annex-B → 浏览器 WebCodecs 硬解 → Canvas 渲染。H264 帧间预测天然只传变化部分（增量传输）
+- **兜底画面**：浏览器不支持 WebCodecs 时自动回退 MJPEG（screencap 降采样，3fps）
 - **触摸控制**：单指 tap / 滑动 / 双指滚屏（touchmove 连续 swipe）
 - **键盘控制**：方向键、Enter/Esc/HOME、播放/暂停、文本输入
 - **鼠标控制**：点击 / 滑动 / 滚轮滚屏
@@ -126,7 +127,7 @@ docker compose up -d cloudflared
 |---|---|
 | `GET /api/health` | 健康检查 |
 | `GET /api/devices` | 所有配置设备 + ADB online 状态 |
-| `GET /video/mjpeg?serial=...&fps=10` | MJPEG 实时视频流（multipart/x-mixed-replace） |
+| `GET /video/mjpeg?serial=...&fps=3` | 兜底 MJPEG 流（multipart/x-mixed-replace） |
 | `GET /video/screenshot?serial=...` | 单帧 PNG 截图 |
 
 ### WebSocket
@@ -153,6 +154,18 @@ docker compose up -d cloudflared
 { "type": "connect_device", "serial": "192.168.0.131:5555" }
 // → { "type": "connected", "serial": "192.168.0.131:5555" }
 ```
+
+**开始 / 停止 H264 视频流**：
+
+```json
+{ "type": "video_start", "serial": "192.168.0.131:5555" }
+// → { "type": "video_meta", "codec": "h264", "width": 1280, "height": 720, "bitrate": 2000000 }
+// → 之后为二进制消息：Annex-B H264 码流（NAL 序列）
+
+{ "type": "video_stop" }
+```
+
+服务端按需启动 `screenrecord`（有客户端才采集，全部断开自动停止），单次 170 秒自动续接。
 
 **控制事件**：
 
@@ -200,7 +213,7 @@ ws-scrcpy-home-control/
 │   └── js/app.js              # 触摸/鼠标/键盘 → WS control
 ├── scripts/
 │   ├── docker-entrypoint.sh   # 宿主 ADB daemon 启动
-│   └── scrcpy-server.jar      # 备用（当前 MJPEG 方案未使用）
+│   └── scrcpy-server.jar      # 备用（当前用 screenrecord + WebCodecs 方案）
 ├── cloudflare/
 │   └── config.yml             # Cloudflare Tunnel ingress
 └── package.json               # express, ws, adbkit
@@ -228,9 +241,21 @@ compose 里已设 `ADB_HOST=host.docker.internal`，Node.js server 会复用宿�
 
 看容器日志：`docker logs ws-scrcpy-home -f`
 
+- `[H264] capture start` → 采集已启动
+- `[H264] capture exit` 反复出现 → 设备不支持 `--size 1280x720`，用 `H264_SIZE=1920x1080` 或 `H264_SIZE=`（空）重建镜像
 - `[CONTROL]` 日志有 → adb shell 命令在发
-- `[MJPEG] Stream started` → 视频流正常
 - 没 `[CONTROL]` → 前端 WS 消息没到，检查浏览器控制台
+
+浏览器控制台应出现 `[H264] decoder configured avc1.xxxxxx`；若出现 `回退 MJPEG` 说明浏览器不支持 WebCodecs（走慢速兜底）。
+
+### Q：画面还是慢？
+
+瓶颈原本是 `screencap`：设备端 1080p PNG 编码要 ~1 秒/帧。现在改用 `screenrecord` 硬件编码，可在 compose 里调：
+
+```yaml
+- H264_SIZE=1280x720      # 更低可设 960x540
+- H264_BITRATE=2000000    # 降到 1000000 可省带宽
+```
 
 ### Q：iPhone 双指滚屏失效？
 
@@ -250,9 +275,9 @@ docker compose restart ws-scrcpy-home
 |---|---|
 | 服务端 | Node.js 20, Express 4, ws (WebSocket) |
 | ADB | adbkit 2.11.1（宿主 daemon 代理：`ADB_HOST=host.docker.internal`） |
-| 视频 | MJPEG（`multipart/x-mixed-replace`），adbkit `screencap()` → Stream → PNG Buffer |
+| 视频 | 主：`adb exec-out screenrecord --output-format=h264` → Annex-B → WS 二进制；兜底：adbkit `screencap()` → MJPEG |
 | 控制 | `adb shell input tap/swipe/keyevent/text` |
-| 前端 | 原生 JS, MJPEG `<img>` 自动刷新, touch/mouse/keyboard 事件 → WS control messages |
+| 前端 | 原生 JS + WebCodecs `VideoDecoder`（Annex-B → AVCC，Canvas 绘制），不支持时回退 MJPEG `<img>`，touch/mouse/keyboard → WS control messages |
 | 公网访问 | Cloudflare Tunnel |
 | 容器 | Docker Compose, `node:20-bookworm-slim`, platform-tools, OpenJDK 17 |
 
