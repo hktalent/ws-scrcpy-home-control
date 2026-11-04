@@ -173,7 +173,37 @@ html, body {
 }
 
 .device-item .icon {
-  font-size: 2rem;
+  position: relative;
+  flex: 0 0 56px;
+  width: 56px;
+  height: 56px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #16213e;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.6rem;
+}
+
+.device-item .icon img.thumb {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 离线：保留最后画面但灰化（stale），没有历史画面才落回占位图标 */
+.device-item.offline .icon img.thumb {
+  filter: grayscale(1) brightness(0.7);
+}
+
+.device-item .icon .icon-fallback {
+  font-size: 1.6rem;
+  line-height: 1;
+  opacity: 0.9;
 }
 
 .device-item .info {
@@ -303,23 +333,31 @@ html, body {
   to { transform: rotate(360deg); }
 }
 
-/* 十字方向键 (DPAD) — 手机上文字太难点，用方向键移动焦点 */
+/* 底部控制区：方向键 + 功能键在同一行内占位排列（不悬浮、不遮挡画面） */
+.control-dock {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #0f3460;
+}
+
+/* 十字方向键 (DPAD) — 小尺寸，贴左排列 */
 .dpad {
+  flex: 0 0 126px;
+  width: 126px;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   grid-template-rows: repeat(3, 1fr);
-  gap: 8px;
-  width: 200px;
-  max-width: 60vw;
-  margin: 12px auto 4px;
+  gap: 4px;
 }
 .dpad-btn {
   aspect-ratio: 1 / 1;
   border: none;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #16213e;
   color: #eee;
-  font-size: 1.4rem;
+  font-size: 0.95rem;
   font-weight: bold;
   cursor: pointer;
   display: flex;
@@ -335,7 +373,7 @@ html, body {
 }
 .dpad-btn.dpad-ok {
   background: #e94560;
-  font-size: 1rem;
+  font-size: 0.72rem;
   letter-spacing: 1px;
 }
 .dpad-btn.dpad-ok:active {
@@ -343,11 +381,11 @@ html, body {
 }
 
 .control-buttons {
+  flex: 1;
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 10px;
-  padding: 16px;
-  background: #0f3460;
+  gap: 8px;
+  min-width: 0;
 }
 
 .ctrl-btn {
@@ -368,21 +406,25 @@ html, body {
 
 /* Landscape optimization */
 @media (orientation: landscape) and (max-height: 500px) {
+  .control-dock {
+    padding: 6px 10px;
+    gap: 8px;
+  }
   .dpad {
-    width: 110px;
-    gap: 5px;
-    margin: 6px auto;
+    flex: 0 0 96px;
+    width: 96px;
+    gap: 3px;
   }
   .dpad-btn {
-    font-size: 1rem;
-    border-radius: 10px;
+    font-size: 0.8rem;
+    border-radius: 6px;
   }
   .dpad-btn.dpad-ok {
-    font-size: 0.7rem;
+    font-size: 0.6rem;
   }
   .control-buttons {
     grid-template-columns: repeat(8, 1fr);
-    padding: 8px;
+    gap: 6px;
   }
   .ctrl-btn {
     padding: 10px;

@@ -8,9 +8,10 @@
     "dev": "node server/index.js"
   },
   "dependencies": {
+    "adbkit": "^2.11.1",
     "express": "^4.19.2",
-    "ws": "^8.17.0",
-    "adbkit": "^2.11.1"
+    "sharp": "^0.35.5",
+    "ws": "^8.17.0"
   },
   "engines": {
     "node": ">=18"

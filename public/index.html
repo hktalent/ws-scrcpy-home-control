@@ -35,7 +35,7 @@
 </div>
 
 <!-- Control Screen -->
-<div id="control-screen" class="screen">
+<div id="control-screen" class="screen control-screen">
   <div class="control-container">
     <div class="top-bar">
       <button id="back-btn" class="btn-icon" title="返回">←</button>
@@ -55,28 +55,30 @@
       </div>
     </div>
 
-    <!-- 十字方向键：手机上文字太难点，用 DPAD 移动焦点光标 -->
-    <div class="dpad">
-      <span></span>
-      <button class="dpad-btn" data-keycode="19" title="上">▲</button>
-      <span></span>
-      <button class="dpad-btn" data-keycode="21" title="左">◀</button>
-      <button class="dpad-btn dpad-ok" data-keycode="23" title="确认">OK</button>
-      <button class="dpad-btn" data-keycode="22" title="右">▶</button>
-      <span></span>
-      <button class="dpad-btn" data-keycode="20" title="下">▼</button>
-      <span></span>
-    </div>
+    <!-- 底部控制区：方向键在容器内贴边占位（不再悬浮遮挡画面），尺寸收小 -->
+    <div class="control-dock">
+      <div class="dpad" id="dpad">
+        <span></span>
+        <button class="dpad-btn" data-keycode="19" title="上">▲</button>
+        <span></span>
+        <button class="dpad-btn" data-keycode="21" title="左">◀</button>
+        <button class="dpad-btn dpad-ok" data-keycode="23" title="确认">OK</button>
+        <button class="dpad-btn" data-keycode="22" title="右">▶</button>
+        <span></span>
+        <button class="dpad-btn" data-keycode="20" title="下">▼</button>
+        <span></span>
+      </div>
 
-    <div class="control-buttons">
-      <button class="ctrl-btn" data-keycode="3" title="Home">🏠</button>
-      <button class="ctrl-btn" data-keycode="4" title="Back">⬅️</button>
-      <button class="ctrl-btn" data-keycode="82" title="Menu">📋</button>
-      <button class="ctrl-btn" data-keycode="26" title="Power">⚡</button>
-      <button class="ctrl-btn" data-keycode="24" title="Volume Up">🔊</button>
-      <button class="ctrl-btn" data-keycode="25" title="Volume Down">🔉</button>
-      <button class="ctrl-btn" data-keycode="187" title="Recent Apps">🪟</button>
-      <button class="ctrl-btn" id="screenshot-btn" title="Screenshot">📸</button>
+      <div class="control-buttons">
+        <button class="ctrl-btn" data-keycode="3" title="Home">🏠</button>
+        <button class="ctrl-btn" data-keycode="4" title="Back">⬅️</button>
+        <button class="ctrl-btn" data-keycode="82" title="Menu">📋</button>
+        <button class="ctrl-btn" data-keycode="26" title="Power">⚡</button>
+        <button class="ctrl-btn" data-keycode="24" title="Volume Up">🔊</button>
+        <button class="ctrl-btn" data-keycode="25" title="Volume Down">🔉</button>
+        <button class="ctrl-btn" data-keycode="187" title="Recent Apps">🪟</button>
+        <button class="ctrl-btn" id="screenshot-btn" title="Screenshot">📸</button>
+      </div>
     </div>
   </div>
 </div>

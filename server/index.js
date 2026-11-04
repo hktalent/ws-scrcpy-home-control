@@ -19,6 +19,14 @@ const adb = require('adbkit');
 const net = require('net');
 const { exec, spawn } = require('child_process');
 
+// 缩略图解码/缩放（纯服务端处理，失败时降级为不出图，不影响投屏/控制）
+let sharp = null;
+try {
+  sharp = require('sharp');
+} catch (e) {
+  console.error('[THUMB] sharp 不可用，缩略图功能关闭:', e.message);
+}
+
 // ====== Config ======
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, '..', 'config', 'default.json');
 let config;
@@ -302,6 +310,102 @@ function getH264Capture(serial) {
 }
 function detachAllCaptures(ws) {
   for (const cap of h264Captures.values()) cap.remove(ws);
+}
+
+// ====== 设备缩略图（定时 screencap → 小图缓存）======
+// 目标：设备列表显示每台设备"最后一次看到"的画面，离线也保留最后一帧。
+// 约束：单设备 1~3s 级刷新、失败保留旧帧、缓存有上限、绝不阻塞/影响投屏与控制。
+const THUMB_REFRESH_MS = parseInt(process.env.THUMB_REFRESH_MS || '2000', 10);
+const THUMB_TICK_MS = parseInt(process.env.THUMB_TICK_MS || '1000', 10);
+const THUMB_WIDTH = parseInt(process.env.THUMB_WIDTH || '160', 10);
+// 缓存条目上限：按设备数量即可（再多也只会是 discovery 出来的设备）
+const THUMB_MAX_ENTRIES = Math.max(8, Math.min(64, (config.devices || []).length + 8));
+
+const thumbCache = new Map();      // serial -> { jpeg, at }（Map 保序，用于 LRU 淘汰）
+const thumbLastAttempt = new Map(); // serial -> 上次抓取尝试时间（限频用）
+const thumbLastError = new Map();   // serial -> 上次错误信息（只在变化时打日志，避免刷屏）
+const mjpegActive = new Map();      // serial -> 正在观看 MJPEG 的客户端数（投屏时缩略图让路）
+let thumbBusy = false;              // 全局串行：同一时刻只抓一台，避免压垮设备/ADB
+
+function setThumb(serial, jpeg) {
+  thumbCache.delete(serial); // 重新插入到末尾，维持 LRU 顺序
+  thumbCache.set(serial, { jpeg, at: Date.now() });
+  while (thumbCache.size > THUMB_MAX_ENTRIES) {
+    const oldest = thumbCache.keys().next().value;
+    thumbCache.delete(oldest);
+  }
+}
+
+async function captureThumb(serial) {
+  if (!adbClient || !sharp) return null;
+  const stream = await adbClient.screencap(serial);
+  const png = await streamToBuffer(stream);
+  if (!png || png.length < 100) throw new Error('empty screencap');
+  // 等比缩到 160px 宽，JPEG 压缩（体积约 5~15KB）
+  return sharp(png)
+    .resize({ width: THUMB_WIDTH, withoutEnlargement: true })
+    .jpeg({ quality: 72 })
+    .toBuffer();
+}
+
+// 抓一帧写入缓存；失败保留旧帧。返回是否成功。
+async function captureIntoCache(serial) {
+  if (!adbClient || !sharp || thumbBusy) return false;
+  thumbBusy = true;
+  thumbLastAttempt.set(serial, Date.now());
+  try {
+    const jpeg = await captureThumb(serial);
+    if (!jpeg) return false;
+    setThumb(serial, jpeg);
+    if (thumbLastError.has(serial)) {
+      log('[THUMB]', serial, '恢复');
+      thumbLastError.delete(serial);
+    }
+    return true;
+  } catch (e) {
+    const msg = e.message || String(e);
+    if (thumbLastError.get(serial) !== msg) {
+      // 只记录状态变化，失败期间不重复打日志
+      log('[THUMB]', serial, '抓取失败（保留上一帧）:', msg);
+      thumbLastError.set(serial, msg);
+    }
+    return false;
+  } finally {
+    thumbBusy = false;
+  }
+}
+
+// 每 tick 最多抓一台在线且"已到刷新时间"的设备（串行，避免多设备并发抢带宽）
+async function thumbTick() {
+  if (thumbBusy || !adbClient || !sharp)
+    return;
+  try {
+    const devices = await getAllDevices();
+    for (const dev of devices) {
+      if (!dev.online) continue; // 离线设备不抓，保留最后画面
+      const cap = h264Captures.get(dev.serial);
+      if (cap && cap.clients.size > 0) continue; // 正在投屏时让路，避免掉帧
+      if ((mjpegActive.get(dev.serial) || 0) > 0) continue; // MJPEG 观看中同样让路
+      if (Date.now() - (thumbLastAttempt.get(dev.serial) || 0) < THUMB_REFRESH_MS) continue;
+      await captureIntoCache(dev.serial);
+      break;
+    }
+  } catch (e) {
+    // 缩略图永远不能影响主流程
+  }
+}
+
+// 给设备列表附加缩略图状态（供前端判断是否已有画面 / 是否需要换 src）
+function decorateDevices(list) {
+  return list.map((d) => {
+    const t = thumbCache.get(d.serial);
+    return {
+      ...d,
+      hasThumb: !!t,
+      thumbAt: t ? t.at : 0,
+      thumbStale: !d.online && !!t // 离线：仍显示最后画面，但标记 stale
+    };
+  });
 }
 
 function ipToInt(ip) {
@@ -632,8 +736,30 @@ app.use(express.static(publicDir));
 
 app.get('/api/devices', async (req, res) => {
   const devices = await getAllDevices(true);  // force refresh to get latest ADB state
-  res.json({ devices });
+  res.json({ devices: decorateDevices(devices) });
 });
+
+// 轻量轮询接口：只读内存缓存（不触发 ADB 查询/截图），供前端 2s 级更新列表图标与在线状态
+app.get('/api/thumbs', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ devices: decorateDevices(devicesCache) });
+});
+
+// 单设备缩略图（最近一帧）；?refresh=1 时立即补抓一次（切换到设备时用）
+app.get('/api/thumb', async (req, res) => {
+  const serial = String(req.query.serial || '');
+  if (!serial) { res.status(400).send('serial required'); return; }
+  if (req.query.refresh === '1') {
+    await captureIntoCache(serial).catch(() => {});
+  }
+  const item = thumbCache.get(serial);
+  if (!item) { res.status(404).send('no thumbnail'); return; }
+  res.set('Content-Type', 'image/jpeg');
+  res.set('Cache-Control', 'public, max-age=60');
+  res.set('X-Thumb-At', String(item.at));
+  res.end(item.jpeg);
+});
+
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, adb: !!adbClient, sessions: scrcpySessions.size });
@@ -671,6 +797,14 @@ app.get('/video/mjpeg', async (req, res) => {
   let cancelled = false;
   req.on('close', () => { cancelled = true; });
   req.on('end', () => { cancelled = true; });
+
+  // 记录 MJPEG 活跃状态：此时缩略图抓取让路，避免和投屏抢设备
+  const releaseMjpeg = () => {
+    const n = (mjpegActive.get(serial) || 0) - 1;
+    if (n > 0) mjpegActive.set(serial, n); else mjpegActive.delete(serial);
+  };
+  mjpegActive.set(serial, (mjpegActive.get(serial) || 0) + 1);
+  res.on('close', releaseMjpeg);
   
   log('[MJPEG] Stream started for', serial, '@', fps, 'fps');
   let lastFrame = null; // 画面没变就不发，省带宽
@@ -751,7 +885,7 @@ wss.on('connection', (ws, req) => {
         log('[WS] Authenticated:', clientIp);
         // Send device list: ALL configured/discovered devices (前端自己根据 online 渲染)
         const devices = await getAllDevices();
-        ws.send(JSON.stringify({ type: 'device_list', devices }));
+        ws.send(JSON.stringify({ type: 'device_list', devices: decorateDevices(devices) }));
       } else {
         ws.send(JSON.stringify({ type: 'auth_fail', message: 'Invalid password' }));
         log('[WS] Auth failed from', clientIp);
@@ -771,14 +905,14 @@ wss.on('connection', (ws, req) => {
     // List devices
     if (msg.type === 'list_devices') {
       const devices = await getAllDevices();
-      ws.send(JSON.stringify({ type: 'device_list', devices }));
+      ws.send(JSON.stringify({ type: 'device_list', devices: decorateDevices(devices) }));
       return;
     }
     
     // Refresh devices (re-scan)
     if (msg.type === 'refresh_devices') {
       const devices = await getAllDevices(true);  // force refresh
-      ws.send(JSON.stringify({ type: 'device_list', devices }));
+      ws.send(JSON.stringify({ type: 'device_list', devices: decorateDevices(devices) }));
       return;
     }
     
@@ -914,6 +1048,10 @@ setInterval(async () => {
     await getAllDevices();
   } catch (e) {}
 }, 30000); // every 30s
+
+// 缩略图刷新循环（单设备 1~3s 级；投屏中自动让路）
+setInterval(thumbTick, THUMB_TICK_MS);
+log('[THUMB] 已启动（刷新间隔', THUMB_REFRESH_MS, 'ms，宽度', THUMB_WIDTH, 'px）');
 
 // ====== ADB auto-reconnect watchdog ======
 // 每 60s 检查：如果配置里的设备不在 ADB 列表中，就通过宿主 ADB daemon 发 host:connect

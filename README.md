@@ -12,6 +12,8 @@
 - **键盘控制**：方向键、Enter/Esc/HOME、播放/暂停、文本输入
 - **鼠标控制**：点击 / 滑动 / 滚轮滚屏
 - **设备发现**：配置文件 + ADB listDevices 自动匹配 online 状态
+- **设备缩略图**：服务端每 ~2s 抓一帧 `screencap` → 160px JPEG 缓存，设备列表直接显示"最后一次看到的画面"；离线保留最后一帧并灰化（stale），无历史画面才显示占位图标
+- **自动上线**：宿主侧 `scripts/adb-autoconnect.sh` 每 5s 探测配置设备并自动 `adb connect`，离线设备回来即恢复
 - **零 App 安装**：设备只需要开启开发者选项 → USB 调试 + TCP/IP 调试
 
 ## 架构
@@ -53,6 +55,23 @@ adb kill-server
 adb -a start-server                    # -a 才会监听 0.0.0.0:5037
 adb connect 192.168.0.131:5555         # 你的电视/投影仪 IP
 adb devices                            # 应看到 "device" 状态
+```
+
+#### 设备自动上线（每 5s）
+
+[scripts/adb-autoconnect.sh](scripts/adb-autoconnect.sh) 常驻执行，等效于周期性运行 `adb -a start-server && adb connect <ip>:5555`：
+
+- 设备列表来自 `config/default.json` 的 `devices`，改配置即可，不用改脚本
+- 已处于 `device` 状态的设备不会重复 connect
+- 先 `nc` 探 5555 端口，设备关机/断网时直接跳过，避免 `adb connect` 超时拖慢循环
+- 宿主 ADB 若没以 `-a` 监听 `*:5037` 会自动重启 daemon（容器继续通过 `host.docker.internal:5037` 复用）
+- 单实例锁（`/tmp/ws-scrcpy-adb-autoconnect.lock`），日志只在状态变化时写：`/tmp/ws-scrcpy-adb-autoconnect.log`
+
+随服务一起跑：`../startAllSs.sh start` 在 `ensure_host_adb` 之后调用 `ensure_adb_autoconnect` 用 `nohup` 拉起该守护；`status` 显示进程，`check` 校验，`stop` 一并结束。手动运行：
+
+```bash
+bash scripts/adb-autoconnect.sh           # 常驻
+bash scripts/adb-autoconnect.sh --once    # 只跑一轮（排查用）
 ```
 
 #### 设备持久化调试模式
@@ -126,7 +145,9 @@ docker compose up -d cloudflared
 | 端点 | 说明 |
 |---|---|
 | `GET /api/health` | 健康检查 |
-| `GET /api/devices` | 所有配置设备 + ADB online 状态 |
+| `GET /api/devices` | 所有配置设备 + ADB online 状态（含 `hasThumb` / `thumbAt` / `thumbStale`） |
+| `GET /api/thumbs` | 轻量轮询：只读内存缓存，返回各设备在线状态与缩略图版本号（前端每 2s 调用一次） |
+| `GET /api/thumb?serial=...&refresh=1` | 单设备缩略图 JPEG（最近一帧）；`refresh=1` 立即补抓（切换设备时用） |
 | `GET /video/mjpeg?serial=...&fps=3` | 兜底 MJPEG 流（multipart/x-mixed-replace） |
 | `GET /video/screenshot?serial=...` | 单帧 PNG 截图 |
 
@@ -212,11 +233,12 @@ ws-scrcpy-home-control/
 │   ├── css/style.css
 │   └── js/app.js              # 触摸/鼠标/键盘 → WS control
 ├── scripts/
+│   ├── adb-autoconnect.sh     # 宿主侧每 5s 探测/连接设备（单实例）
 │   ├── docker-entrypoint.sh   # 宿主 ADB daemon 启动
 │   └── scrcpy-server.jar      # 备用（当前用 screenrecord + WebCodecs 方案）
 ├── cloudflare/
 │   └── config.yml             # Cloudflare Tunnel ingress
-└── package.json               # express, ws, adbkit
+└── package.json               # express, ws, adbkit, sharp（缩略图缩放）
 ```
 
 ## 常见问题
@@ -273,7 +295,7 @@ docker compose restart ws-scrcpy-home
 
 | 组件 | 技术 |
 |---|---|
-| 服务端 | Node.js 20, Express 4, ws (WebSocket) |
+| 服务端 | Node.js 20, Express 4, ws (WebSocket), sharp（缩略图缩放） |
 | ADB | adbkit 2.11.1（宿主 daemon 代理：`ADB_HOST=host.docker.internal`） |
 | 视频 | 主：`adb exec-out screenrecord --output-format=h264` → Annex-B → WS 二进制；兜底：adbkit `screencap()` → MJPEG |
 | 控制 | `adb shell input tap/swipe/keyevent/text` |

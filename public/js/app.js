@@ -96,6 +96,7 @@
         $('auth-message').classList.add('hidden');
         showScreen('device-screen');
         refreshDeviceList();
+        startDevicePolling();
         break;
         
       case 'auth_fail':
@@ -362,6 +363,44 @@
   });
 
   // ===== Device List =====
+  function thumbUrl(serial, at) {
+    // 带版本号做 cache-busting：同一帧不重复下载，新帧换 URL 自动更新
+    return `/api/thumb?serial=${encodeURIComponent(serial)}&v=${at || 0}`;
+  }
+
+  // 缩略图：始终显示该设备"最后一次看到的画面"；从未抓到过才落回占位图标
+  function applyThumb(item, dev) {
+    const img = item.querySelector('img.thumb');
+    if (!img) return;
+    item.classList.toggle('has-thumb', !!dev.hasThumb);
+    item.classList.toggle('stale', !!dev.thumbStale);
+    if (!dev.hasThumb) {
+      img.removeAttribute('src');
+      img.style.display = 'none';
+      return;
+    }
+    img.style.display = 'block';
+    if (img.dataset.v !== String(dev.thumbAt)) {
+      img.dataset.v = String(dev.thumbAt);
+      img.src = thumbUrl(dev.serial, dev.thumbAt);
+    }
+  }
+
+  // 在线状态样式/文案就地更新（不重建 DOM，避免列表跳动）
+  function applyOnline(item, dev) {
+    const online = !!dev.online;
+    item.classList.toggle('offline', !online);
+    const dot = item.querySelector('.status-dot');
+    if (dot) {
+      dot.classList.toggle('online', online);
+      dot.classList.toggle('offline', !online);
+    }
+    const statusText = item.querySelector('.status-text');
+    if (statusText) statusText.textContent = online ? '在线' : '离线';
+    const stateText = item.querySelector('.state-text');
+    if (stateText) stateText.textContent = online ? '可连接' : '离线';
+  }
+
   function renderDeviceList(devices) {
     const list = $('device-list');
     list.innerHTML = '';
@@ -375,22 +414,55 @@
       const online = !!dev.online;
       const item = document.createElement('div');
       item.className = 'device-item' + (online ? '' : ' offline');
+      item.dataset.serial = dev.serial;
       item.innerHTML = `
-        <div class="icon">${getDeviceIcon(dev.type, dev.name)}</div>
+        <div class="icon">
+          <span class="icon-fallback">${getDeviceIcon(dev.type, dev.name)}</span>
+          <img class="thumb" alt="" loading="lazy">
+        </div>
         <div class="info">
           <div class="name">${dev.name || dev.serial}</div>
-          <div class="serial">${dev.serial} · ${online ? '可连接' : '离线'}</div>
+          <div class="serial">${dev.serial} · <span class="state-text">${online ? '可连接' : '离线（最后画面）'}</span></div>
         </div>
         <div class="status">
           <span class="status-dot ${online ? 'online' : 'offline'}"></span>
-          ${online ? '在线' : '离线'}
+          <span class="status-text">${online ? '在线' : '离线'}</span>
         </div>
       `;
+      applyThumb(item, dev);
       // 无论 online 与否都允许点击：在线状态可能因 ADB 查询超时而误判，
       // 真正的可用性由服务端连接结果决定
       item.addEventListener('click', () => selectDevice(dev));
       list.appendChild(item);
     });
+  }
+
+  // ===== 设备列表轮询（只读轻量接口，单请求覆盖所有设备）=====
+  let devicePollTimer = null;
+
+  async function pollDeviceStates() {
+    if (!deviceScreen.classList.contains('active')) { stopDevicePolling(); return; }
+    try {
+      const r = await fetch('/api/thumbs', { cache: 'no-store' });
+      const data = await r.json();
+      (data.devices || []).forEach(dev => {
+        const item = document.querySelector(`.device-item[data-serial="${dev.serial}"]`);
+        if (!item) return;
+        applyOnline(item, dev);
+        applyThumb(item, dev);
+      });
+    } catch (e) {
+      // 轮询失败忽略，下一轮再试，不影响操作
+    }
+  }
+
+  function startDevicePolling() {
+    if (devicePollTimer) return;
+    devicePollTimer = setInterval(pollDeviceStates, 2000);
+  }
+
+  function stopDevicePolling() {
+    if (devicePollTimer) { clearInterval(devicePollTimer); devicePollTimer = null; }
   }
 
   function getDeviceIcon(type, name) {
@@ -413,6 +485,10 @@
     $('current-device-name').textContent = dev.name || dev.serial;
     showScreen('control-screen');
     showLoading();
+    stopDevicePolling();
+    // 切换设备时立即刷新该设备缩略图（服务端补抓一帧，返回列表时就是新画面）
+    fetch(`/api/thumb?serial=${encodeURIComponent(dev.serial)}&refresh=1&v=${Date.now()}`, { cache: 'no-store' })
+      .catch(() => {});
     sendMsg('connect_device', { serial: dev.serial });
   }
 
@@ -433,6 +509,7 @@
     stopVideoStream();
     showScreen('device-screen');
     refreshDeviceList();
+    startDevicePolling();
   });
 
   // ===== Video Stream: 优先 H264(WebCodecs)，不支持则回退 MJPEG =====
